@@ -1,0 +1,12 @@
+!SESSION 2026-02-21 14:37:52.557 -----------------------------------------------
+eclipse.buildId=Version 2.0.0
+java.version=21.0.8
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=linux, ARCH=x86_64, WS=gtk, NL=en_US
+Command-line arguments:  -os linux -ws gtk -arch x86_64
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-02-21 14:38:14.037
+!MESSAGE Log4j2 initialized with config file /home/ilia/STM32_Projects/F103_Jitter_PoC/.metadata/.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-02-21 14:38:16.975
+!MESSAGE Started RMI Server, listening on port 41337
