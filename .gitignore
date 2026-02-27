@@ -1,0 +1,15 @@
+mx.scratch
+!.settings
+build/
+Debug/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+CMakeCache.txt
+compile_commands.json

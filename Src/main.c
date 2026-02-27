@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
@@ -76,10 +77,12 @@ typedef struct {
     uint32_t deadline_misses;
     uint32_t max_response_us;
     uint32_t max_pure_c_us;
+    int32_t  min_pure_c_us;
     uint64_t sum_pure_c_us;
 } TaskStats_t;
 
 TaskStats_t stats[2];
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -96,14 +99,25 @@ void StartDefaultTask(void *argument);
 /* USER CODE BEGIN 0 */
 
 // timing
-static uint64_t dwt_overflows = 0;
-static uint32_t last_dwt = 0;
+static volatile uint64_t dwt_overflows = 0;
+static volatile uint32_t last_dwt = 0;
 
 static inline uint64_t get_micros64(void) {
-    uint32_t now = DWT->CYCCNT;
-    if (now < last_dwt) dwt_overflows += (1ULL << 32);
+    uint32_t now;
+    uint64_t overflows;
+
+    taskENTER_CRITICAL();
+
+    now = DWT->CYCCNT;
+    if (now < last_dwt) {
+        dwt_overflows += (1ULL << 32);
+    }
     last_dwt = now;
-    return (dwt_overflows + now) / 64ULL;   // 64 MHz -> ms
+    overflows = dwt_overflows;
+
+    taskEXIT_CRITICAL();
+
+    return (overflows + now) / 64ULL;
 }
 void App_TraceSwitchedIn(void) {
     task_cpu_start_cycles = DWT->CYCCNT;
@@ -147,6 +161,7 @@ typedef struct {
     uint8_t  idx;          // 0 = High, 1 = Med
 } TaskParams_t;
 
+
 void PeriodicTask(void *argument) {
     TaskParams_t *p = (TaskParams_t *)argument;
 
@@ -160,11 +175,18 @@ void PeriodicTask(void *argument) {
         /* Start fresh measurement for this job */
         task_cpu_cycles[p->idx] = 0;
 
-        /* Workload (tune loops to get desired C) */
-        for (volatile uint32_t i = 0; i < p->workload_loops; i++);
+        for (volatile uint32_t i = 0; i < p->workload_loops; i++){
+        	if (i % (rand() % 10 + 1) == 0) {
+        	        volatile uint32_t dummy = i * 2;
+        	} else if (rand() % 3) {
+        		volatile uint32_t dummy = i * 2;
+        	} else if (rand() % 2) {
+        		volatile uint32_t dummy = i * 2;
+        		volatile uint32_t dummy2 = i * 2;
+        	}
+        }
 
-        uint64_t finish_us = get_micros64();
-        uint32_t response_us = (uint32_t)(finish_us - release_us);
+
 
 
 
@@ -173,17 +195,20 @@ void PeriodicTask(void *argument) {
         if (jitter_us > stats[p->idx].max_jitter_us) stats[p->idx].max_jitter_us = jitter_us;
         stats[p->idx].sum_jitter_us += jitter_us;
         stats[p->idx].job_count++;
-        if (response_us > stats[p->idx].max_response_us) stats[p->idx].max_response_us = response_us;
-        if (response_us > (p->period_ms * 1000UL)){
-        	stats[p->idx].deadline_misses++;
-        }
+
         /* Pure execution time C = all CPU slices + current slice */
         uint32_t current_slice = DWT->CYCCNT - task_cpu_start_cycles;
         uint32_t pure_c_us     = (task_cpu_cycles[p->idx] + current_slice) / 64U;
 
         if (pure_c_us > stats[p->idx].max_pure_c_us)     stats[p->idx].max_pure_c_us = pure_c_us;
+        if (pure_c_us < stats[p->idx].min_pure_c_us)     stats[p->idx].min_pure_c_us = pure_c_us;
         stats[p->idx].sum_pure_c_us += pure_c_us;
-
+        uint64_t finish_us = get_micros64();
+        uint32_t response_us = (uint32_t)(finish_us - release_us);
+        if (response_us > stats[p->idx].max_response_us) stats[p->idx].max_response_us = response_us;
+        if (response_us > (p->period_ms * 1000UL)){
+        	stats[p->idx].deadline_misses++;
+        }
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(p->period_ms));
         theoretical_us += (uint64_t)p->period_ms * 1000ULL;
     }
@@ -192,9 +217,9 @@ void PeriodicTask(void *argument) {
 
 /* Monitor Task*/
 void MonitorTask(void *arg) {
-    char buf[160];
+    char buf[170];
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(120000); // 60 s window
+    const TickType_t xFrequency = pdMS_TO_TICKS(10000); // X0 s window
 
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -207,7 +232,7 @@ void MonitorTask(void *arg) {
 
             int len = snprintf(buf, sizeof(buf),
                 "Task %d | Jobs:%lu | Jitter min/avg/max: %ld/%ld/%ld us | "
-                "Max R: %lu us | Max C: %lu us | Avg C: %lu us | Misses: %lu\r\n",
+                "Max R: %lu us | Max C: %lu us | Min C: %ld us | Avg C: %lu us | Misses: %lu\r\n",
                 i,
                 stats[i].job_count,
                 stats[i].min_jitter_us,
@@ -215,6 +240,7 @@ void MonitorTask(void *arg) {
                 stats[i].max_jitter_us,
                 stats[i].max_response_us,
                 stats[i].max_pure_c_us,
+				stats[i].min_pure_c_us,
                 avg_c_us,
                 stats[i].deadline_misses);
 
@@ -224,7 +250,7 @@ void MonitorTask(void *arg) {
                 xSemaphoreGive(uartMutex);
             }
 
-            /* Reset for next 10 s window */
+            /* Reset for next window */
             stats[i].min_jitter_us = INT32_MAX;
             stats[i].max_jitter_us = INT32_MIN;
             stats[i].sum_jitter_us = 0;
@@ -272,7 +298,8 @@ int main(void)
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-
+  last_dwt = 0;
+  dwt_overflows = 0;
   /* Calibration (uses blocking TX) */
   CalibrateWorkload();
 
@@ -285,8 +312,10 @@ int main(void)
       stats[i].deadline_misses = 0;
       stats[i].max_response_us = 0;
       stats[i].max_pure_c_us   = 0;
+      stats[i].min_pure_c_us   = INT32_MAX;
       stats[i].sum_pure_c_us   = 0;
   }
+
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -315,21 +344,18 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   osThreadAttr_t attr = { .stack_size = 512 * 4 };
 
-  /* High priority task (~4.50 ms pure C) */
-  static TaskParams_t highParams = { .period_ms = 10, .workload_loops = 20500, .idx = 0 };
+  static TaskParams_t highParams = { .period_ms = 13, .workload_loops = 3000, .idx = 0 };
   attr.name = "HighTask";
   attr.priority = (osPriority_t) osPriorityAboveNormal;
   hTaskHigh = osThreadNew(PeriodicTask, &highParams, &attr);
 
-  /* Medium priority task*/
-  static TaskParams_t medParams = { .period_ms = 20, .workload_loops = 41100, .idx = 1 };
+  static TaskParams_t medParams = { .period_ms = 40, .workload_loops = 1000, .idx = 1 };
   attr.name = "MedTask";
   attr.priority = (osPriority_t) osPriorityNormal;
   hTaskMed = osThreadNew(PeriodicTask, &medParams, &attr);
 
-  /* Monitor task*/
   attr.name = "Monitor";
-  attr.priority = (osPriority_t) osPriorityBelowNormal;
+  attr.priority = (osPriority_t) osPriorityNormal;
   attr.stack_size = 384 * 4;
   hTaskMonitor = osThreadNew(MonitorTask, NULL, &attr);
 
