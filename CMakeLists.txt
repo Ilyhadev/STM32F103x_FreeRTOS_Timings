@@ -102,7 +102,6 @@ if(OPENOCD)
             -c "reset init"
         DEPENDS ${CMAKE_PROJECT_NAME}
         USES_TERMINAL
-        COMMENT "Launching OpenOCD GDB server (port 3333) - Ctrl+C to stop"
         VERBATIM
     )
 endif()

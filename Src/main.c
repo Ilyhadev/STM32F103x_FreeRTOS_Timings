@@ -23,8 +23,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "FreeRTOS.h"
+#include "queue.h"
 #include "semphr.h"
 #include "task.h"
+#include "mpu6050.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -46,6 +48,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 UART_HandleTypeDef huart1;
 
 /* Definitions for defaultTask */
@@ -57,16 +61,24 @@ const osThreadAttr_t defaultTask_attributes = {
 };
 /* USER CODE BEGIN PV */
 SemaphoreHandle_t uartMutex;      // Protects UART
-SemaphoreHandle_t uartSemaphore;  // Signals TX complete from ISR
 
 /* Task handles - global so trace hooks can identify them */
-TaskHandle_t hTaskHigh   = NULL;
-TaskHandle_t hTaskMed    = NULL;
+TaskHandle_t hTaskI2C     = NULL;
+TaskHandle_t hTaskProcess = NULL;
+TaskHandle_t hTaskUart    = NULL;
 TaskHandle_t hTaskMonitor = NULL;
+
+mpu6050_t Mpu6050 = {0};
 
 /* Pure CPU cycle measurement via trace hooks */
 volatile uint32_t task_cpu_start_cycles = 0;
-volatile uint32_t task_cpu_cycles[2] = {0};   // [0]=High, [1]=Med
+
+#define MEASURED_TASK_COUNT 3
+#define TASK_I2C_IDX        0
+#define TASK_PROCESS_IDX    1
+#define TASK_UART_IDX       2
+
+volatile uint32_t task_cpu_cycles[MEASURED_TASK_COUNT] = {0};
 
 /* Statistics per task (reset every 10 s) */
 typedef struct {
@@ -81,7 +93,7 @@ typedef struct {
     uint64_t sum_pure_c_us;
 } TaskStats_t;
 
-TaskStats_t stats[2];
+TaskStats_t stats[MEASURED_TASK_COUNT];
 
 /* USER CODE END PV */
 
@@ -89,6 +101,7 @@ TaskStats_t stats[2];
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_I2C1_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -105,8 +118,15 @@ static volatile uint32_t last_dwt = 0;
 static inline uint64_t get_micros64(void) {
     uint32_t now;
     uint64_t overflows;
+    BaseType_t scheduler_running = (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED);
+    uint32_t primask = 0;
 
-    taskENTER_CRITICAL();
+    if (scheduler_running) {
+        taskENTER_CRITICAL();
+    } else {
+        primask = __get_PRIMASK();
+        __disable_irq();
+    }
 
     now = DWT->CYCCNT;
     if (now < last_dwt) {
@@ -115,7 +135,11 @@ static inline uint64_t get_micros64(void) {
     last_dwt = now;
     overflows = dwt_overflows;
 
-    taskEXIT_CRITICAL();
+    if (scheduler_running) {
+        taskEXIT_CRITICAL();
+    } else if (primask == 0U) {
+        __enable_irq();
+    }
 
     return (overflows + now) / 64ULL;
 }
@@ -127,10 +151,12 @@ void App_TraceSwitchedOut(void) {
     uint32_t delta = DWT->CYCCNT - task_cpu_start_cycles;
     TaskHandle_t curr = xTaskGetCurrentTaskHandle();
 
-    if (curr == hTaskHigh) {
-        task_cpu_cycles[0] += delta;
-    } else if (curr == hTaskMed) {
-        task_cpu_cycles[1] += delta;
+    if (curr == hTaskI2C) {
+        task_cpu_cycles[TASK_I2C_IDX] += delta;
+    } else if (curr == hTaskProcess) {
+        task_cpu_cycles[TASK_PROCESS_IDX] += delta;
+    } else if (curr == hTaskUart) {
+        task_cpu_cycles[TASK_UART_IDX] += delta;
     }
 }
 void CalibrateWorkload(void) {
@@ -146,94 +172,217 @@ void CalibrateWorkload(void) {
     HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 10);
 }
 
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART1) {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        // Signal the task that transmission is finished
-        xSemaphoreGiveFromISR(uartSemaphore, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+static void DebugLog(const char *msg) {
+    if ((uartMutex != NULL) && (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)) {
+        if (xSemaphoreTake(uartMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+            xSemaphoreGive(uartMutex);
+        }
+    } else {
+        HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
     }
 }
 
+static void CheckCreated(const void *handle, const char *name) {
+    if (handle == NULL) {
+        DebugLog("create failed: ");
+        DebugLog(name);
+        DebugLog("\r\n");
+        Error_Handler();
+    }
+}
+
+#define I2C_TASK_PERIOD_MS     10U
+#define RAW_RING_LEN           8U
+#define PROCESSED_RING_LEN     8U
+#define MPU_AXIS_COUNT         FIFO_SAMPLE_VALUES
+
+static const char *task_names[MEASURED_TASK_COUNT] = {
+    "I2C",
+    "Process",
+    "UART"
+};
+
 typedef struct {
-    uint32_t period_ms;
-    uint32_t workload_loops;
-    uint8_t  idx;          // 0 = High, 1 = Med
-} TaskParams_t;
+    uint32_t seq;
+    uint64_t capture_us;
+    uint64_t ready_us;
+    float value[MPU_AXIS_COUNT]; // ax, ay, az, temp, gx, gy, gz
+} SensorSample_t;
 
+typedef struct {
+    uint32_t seq;
+    uint64_t capture_us;
+    uint64_t ready_us;
+    float value[MPU_AXIS_COUNT];
+} ProcessedSample_t;
 
-void PeriodicTask(void *argument) {
-    TaskParams_t *p = (TaskParams_t *)argument;
+static QueueHandle_t rawRing;
+static QueueHandle_t processedRing;
+static volatile uint32_t raw_drop_count = 0;
+static volatile uint32_t processed_drop_count = 0;
+static volatile uint32_t fifo_empty_count = 0;
+static volatile uint32_t fifo_overflow_count = 0;
+static volatile uint16_t last_fifo_count = 0;
+static volatile uint16_t max_fifo_count = 0;
+
+static void ResetTaskStats(uint8_t idx) {
+    stats[idx].min_jitter_us = INT32_MAX;
+    stats[idx].max_jitter_us = INT32_MIN;
+    stats[idx].sum_jitter_us = 0;
+    stats[idx].job_count = 0;
+    stats[idx].deadline_misses = 0;
+    stats[idx].max_response_us = 0;
+    stats[idx].max_pure_c_us = 0;
+    stats[idx].min_pure_c_us = INT32_MAX;
+    stats[idx].sum_pure_c_us = 0;
+}
+
+static void BeginMeasuredJob(uint8_t idx, int32_t jitter_us) {
+    task_cpu_cycles[idx] = 0;
+
+    if (jitter_us < stats[idx].min_jitter_us) stats[idx].min_jitter_us = jitter_us;
+    if (jitter_us > stats[idx].max_jitter_us) stats[idx].max_jitter_us = jitter_us;
+    stats[idx].sum_jitter_us += jitter_us;
+    stats[idx].job_count++;
+}
+
+static void EndMeasuredJob(uint8_t idx, uint64_t release_us, uint32_t deadline_us) {
+    uint32_t current_slice = DWT->CYCCNT - task_cpu_start_cycles;
+    uint32_t pure_c_us = (task_cpu_cycles[idx] + current_slice) / 64U;
+    uint64_t finish_us = get_micros64();
+    uint32_t response_us = (uint32_t)(finish_us - release_us);
+
+    if (pure_c_us > stats[idx].max_pure_c_us) stats[idx].max_pure_c_us = pure_c_us;
+    if ((int32_t)pure_c_us < stats[idx].min_pure_c_us) stats[idx].min_pure_c_us = (int32_t)pure_c_us;
+    stats[idx].sum_pure_c_us += pure_c_us;
+
+    if (response_us > stats[idx].max_response_us) stats[idx].max_response_us = response_us;
+    if ((deadline_us > 0U) && (response_us > deadline_us)) {
+        stats[idx].deadline_misses++;
+    }
+}
+
+static bool ReadFifoIntoSample(SensorSample_t *sample) {
+    uint16_t fifo_count = MPU6050_Get_FIFO_Count(&Mpu6050);
+    last_fifo_count = fifo_count;
+    if (fifo_count > max_fifo_count) {
+        max_fifo_count = fifo_count;
+    }
+
+    if (fifo_count >= 1024U) {
+        fifo_overflow_count++;
+        MPU6050_Read_Fifo(&Mpu6050);
+        return false;
+    }
+
+    if (fifo_count < FIFO_SAMPLE_SIZE) {
+        fifo_empty_count++;
+        return false;
+    }
+
+    sample->capture_us = get_micros64();
+    MPU6050_Read_Fifo(&Mpu6050);
+    MPU6050_Get_Current_Sample(&Mpu6050, sample->value);
+    sample->ready_us = get_micros64();
+
+    return true;
+}
+
+void I2CReadTask(void *argument) {
+    (void)argument;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
     uint64_t theoretical_us = get_micros64();
+    uint32_t seq = 0;
 
     while (1) {
-    	uint64_t release_us = get_micros64();
-        int32_t  jitter_us  = (int32_t)(release_us - theoretical_us);
+        uint64_t release_us = get_micros64();
+        int32_t jitter_us = (int32_t)(release_us - theoretical_us);
+        SensorSample_t sample = {0};
 
-        /* Start fresh measurement for this job */
-        task_cpu_cycles[p->idx] = 0;
+        BeginMeasuredJob(TASK_I2C_IDX, jitter_us);
 
-        for (volatile uint32_t i = 0; i < p->workload_loops; i++){
-        	if (i % (rand() % 10 + 1) == 0) {
-        	        volatile uint32_t dummy = i * 2;
-        	} else if (rand() % 3) {
-        		volatile uint32_t dummy = i * 2;
-        	} else if (rand() % 2) {
-        		volatile uint32_t dummy = i * 2;
-        		volatile uint32_t dummy2 = i * 2;
-        	}
+        if (ReadFifoIntoSample(&sample)) {
+            sample.seq = seq++;
+            if (xQueueSend(rawRing, &sample, 0) != pdPASS) {
+                raw_drop_count++;
+            }
         }
 
+        theoretical_us += (uint64_t)I2C_TASK_PERIOD_MS * 1000ULL;
+        EndMeasuredJob(TASK_I2C_IDX, release_us, I2C_TASK_PERIOD_MS * 1000U);
 
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(I2C_TASK_PERIOD_MS));
+    }
+}
 
+void ProcessDataTask(void *argument) {
+    (void)argument;
 
+    while (1) {
+        SensorSample_t raw = {0};
+        ProcessedSample_t processed = {0};
 
-        /* Update stats */
-        if (jitter_us < stats[p->idx].min_jitter_us) stats[p->idx].min_jitter_us = jitter_us;
-        if (jitter_us > stats[p->idx].max_jitter_us) stats[p->idx].max_jitter_us = jitter_us;
-        stats[p->idx].sum_jitter_us += jitter_us;
-        stats[p->idx].job_count++;
+        xQueueReceive(rawRing, &raw, portMAX_DELAY);
 
-        /* Pure execution time C = all CPU slices + current slice */
-        uint32_t current_slice = DWT->CYCCNT - task_cpu_start_cycles;
-        uint32_t pure_c_us     = (task_cpu_cycles[p->idx] + current_slice) / 64U;
+        uint64_t release_us = get_micros64();
+        int32_t jitter_us = (int32_t)(release_us - raw.ready_us);
+        BeginMeasuredJob(TASK_PROCESS_IDX, jitter_us);
 
-        if (pure_c_us > stats[p->idx].max_pure_c_us)     stats[p->idx].max_pure_c_us = pure_c_us;
-        if (pure_c_us < stats[p->idx].min_pure_c_us)     stats[p->idx].min_pure_c_us = pure_c_us;
-        stats[p->idx].sum_pure_c_us += pure_c_us;
-        uint64_t finish_us = get_micros64();
-        uint32_t response_us = (uint32_t)(finish_us - release_us);
-        if (response_us > stats[p->idx].max_response_us) stats[p->idx].max_response_us = response_us;
-        if (response_us > (p->period_ms * 1000UL)){
-        	stats[p->idx].deadline_misses++;
+        processed.seq = raw.seq;
+        processed.capture_us = raw.capture_us;
+        for (uint8_t i = 0; i < MPU_AXIS_COUNT; i++) {
+            processed.value[i] = raw.value[i] * 200.0f;
         }
-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(p->period_ms));
-        theoretical_us += (uint64_t)p->period_ms * 1000ULL;
+        processed.ready_us = get_micros64();
+
+        if (xQueueSend(processedRing, &processed, 0) != pdPASS) {
+            processed_drop_count++;
+        }
+
+        EndMeasuredJob(TASK_PROCESS_IDX, release_us, 0);
+    }
+}
+
+void UartSendTask(void *argument) {
+    (void)argument;
+
+    while (1) {
+        ProcessedSample_t processed = {0};
+
+        xQueueReceive(processedRing, &processed, portMAX_DELAY);
+
+        uint64_t release_us = get_micros64();
+        int32_t jitter_us = (int32_t)(release_us - processed.ready_us);
+        BeginMeasuredJob(TASK_UART_IDX, jitter_us);
+
+        EndMeasuredJob(TASK_UART_IDX, release_us, 0);
     }
 }
 
 
 /* Monitor Task*/
 void MonitorTask(void *arg) {
-    char buf[170];
+    (void)arg;
+
+    char buf[220];
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(10000); // X0 s window
 
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < MEASURED_TASK_COUNT; i++) {
             if (stats[i].job_count == 0) continue;
 
             int32_t  avg_jitter = (int32_t)(stats[i].sum_jitter_us / stats[i].job_count);
             uint32_t avg_c_us   = (uint32_t)(stats[i].sum_pure_c_us / stats[i].job_count);
 
             int len = snprintf(buf, sizeof(buf),
-                "Task %d | Jobs:%lu | Jitter min/avg/max: %ld/%ld/%ld us | "
+                "%s | Jobs:%lu | Jitter min/avg/max: %ld/%ld/%ld us | "
                 "Max R: %lu us | Max C: %lu us | Min C: %ld us | Avg C: %lu us | Misses: %lu\r\n",
-                i,
+                task_names[i],
                 stats[i].job_count,
                 stats[i].min_jitter_us,
                 avg_jitter,
@@ -245,21 +394,28 @@ void MonitorTask(void *arg) {
                 stats[i].deadline_misses);
 
             if (xSemaphoreTake(uartMutex, portMAX_DELAY) == pdTRUE) {
-                HAL_UART_Transmit_IT(&huart1, (uint8_t*)buf, len);
-                xSemaphoreTake(uartSemaphore, portMAX_DELAY);
+                HAL_UART_Transmit(&huart1, (uint8_t*)buf, len, 100);
                 xSemaphoreGive(uartMutex);
             }
 
             /* Reset for next window */
-            stats[i].min_jitter_us = INT32_MAX;
-            stats[i].max_jitter_us = INT32_MIN;
-            stats[i].sum_jitter_us = 0;
-            stats[i].job_count     = 0;
-            stats[i].deadline_misses = 0;
-            stats[i].max_response_us = 0;
-            stats[i].max_pure_c_us   = 0;
-            stats[i].sum_pure_c_us   = 0;
+            ResetTaskStats((uint8_t)i);
         }
+
+        int len = snprintf(buf, sizeof(buf),
+            "Buffers | raw drops:%lu | processed drops:%lu | fifo empty:%lu | fifo overflow:%lu | fifo last/max:%u/%u\r\n",
+            raw_drop_count,
+            processed_drop_count,
+            fifo_empty_count,
+            fifo_overflow_count,
+            last_fifo_count,
+            max_fifo_count);
+
+        if (xSemaphoreTake(uartMutex, portMAX_DELAY) == pdTRUE) {
+            HAL_UART_Transmit(&huart1, (uint8_t*)buf, len, 100);
+            xSemaphoreGive(uartMutex);
+        }
+        max_fifo_count = 0;
     }
 }
 /* USER CODE END 0 */
@@ -272,7 +428,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -281,7 +436,6 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -294,6 +448,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
@@ -302,18 +457,13 @@ int main(void)
   dwt_overflows = 0;
   /* Calibration (uses blocking TX) */
   CalibrateWorkload();
-
+  MPU6050_Init(&Mpu6050, &hi2c1);
+  float offsetXYZ[3] = {188.75, 240, 3361.5};
+  float scaleXYZ[3] = {16358.75, 16312.67, 16721.5};
+  MPU6050_Set_Accel_Offset_Scale(&Mpu6050, offsetXYZ, scaleXYZ);
   /* Init stats */
-  for (int i = 0; i < 2; i++) {
-      stats[i].min_jitter_us = INT32_MAX;
-      stats[i].max_jitter_us = INT32_MIN;
-      stats[i].sum_jitter_us = 0;
-      stats[i].job_count     = 0;
-      stats[i].deadline_misses = 0;
-      stats[i].max_response_us = 0;
-      stats[i].max_pure_c_us   = 0;
-      stats[i].min_pure_c_us   = INT32_MAX;
-      stats[i].sum_pure_c_us   = 0;
+  for (int i = 0; i < MEASURED_TASK_COUNT; i++) {
+      ResetTaskStats((uint8_t)i);
   }
 
   /* USER CODE END 2 */
@@ -323,10 +473,10 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_MUTEX */
   uartMutex = xSemaphoreCreateMutex();
+  CheckCreated(uartMutex, "uartMutex");
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
-  uartSemaphore = xSemaphoreCreateBinary();
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -334,35 +484,48 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  rawRing = xQueueCreate(RAW_RING_LEN, sizeof(SensorSample_t));
+  processedRing = xQueueCreate(PROCESSED_RING_LEN, sizeof(ProcessedSample_t));
+  CheckCreated(rawRing, "rawRing");
+  CheckCreated(processedRing, "processedRing");
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  defaultTaskHandle = NULL;
 
   /* USER CODE BEGIN RTOS_THREADS */
-  osThreadAttr_t attr = { .stack_size = 512 * 4 };
+  osThreadAttr_t attr = { .stack_size = 384 * 4 };
 
-  static TaskParams_t highParams = { .period_ms = 13, .workload_loops = 3000, .idx = 0 };
-  attr.name = "HighTask";
+  attr.name = "I2CRead";
   attr.priority = (osPriority_t) osPriorityAboveNormal;
-  hTaskHigh = osThreadNew(PeriodicTask, &highParams, &attr);
+  attr.stack_size = 384 * 4;
+  hTaskI2C = osThreadNew(I2CReadTask, NULL, &attr);
+  CheckCreated(hTaskI2C, "I2CRead");
 
-  static TaskParams_t medParams = { .period_ms = 40, .workload_loops = 1000, .idx = 1 };
-  attr.name = "MedTask";
+  attr.name = "ProcessData";
   attr.priority = (osPriority_t) osPriorityNormal;
-  hTaskMed = osThreadNew(PeriodicTask, &medParams, &attr);
+  attr.stack_size = 256 * 4;
+  hTaskProcess = osThreadNew(ProcessDataTask, NULL, &attr);
+  CheckCreated(hTaskProcess, "ProcessData");
+
+  attr.name = "UartSend";
+  attr.priority = (osPriority_t) osPriorityNormal;
+  attr.stack_size = 512 * 4;
+  hTaskUart = osThreadNew(UartSendTask, NULL, &attr);
+  CheckCreated(hTaskUart, "UartSend");
 
   attr.name = "Monitor";
   attr.priority = (osPriority_t) osPriorityNormal;
   attr.stack_size = 384 * 4;
   hTaskMonitor = osThreadNew(MonitorTask, NULL, &attr);
+  CheckCreated(hTaskMonitor, "Monitor");
 
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
-  HAL_UART_Transmit(&huart1, (uint8_t*)"=== All tasks created - starting scheduler ===\r\n", 48, 100);
+  static const char startMsg[] = "=== I2C/process/UART jitter pipeline starting ===\r\n";
+  HAL_UART_Transmit(&huart1, (uint8_t*)startMsg, sizeof(startMsg) - 1U, 100);
   /* USER CODE END RTOS_EVENTS */
 
   /* Start scheduler */
@@ -420,6 +583,40 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -465,6 +662,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
