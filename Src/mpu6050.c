@@ -25,7 +25,7 @@ void MPU6050_Init (mpu6050_t *mpu6050, I2C_HandleTypeDef *hi2c1)
 	  HAL_Delay(100);
 
 	  // Wake up and set clock source to PLL with X-axis gyro reference
-	  Data = 0x01; // Use PLL with X-axis gyro, not internal oscillator
+	  Data = 0x00; // Use internal oscillator
 	  HAL_I2C_Mem_Write(hi2c1, MPU6050_ADDR, PWR_MGMT_1, 1, &Data, 1, 1000);
 	  HAL_Delay(100);
 
